@@ -1659,8 +1659,17 @@ Vertical Timeline - by CodyHouse.co
 }
 
 .sideways-lr {
-  writing-mode: sideways-lr;
+  writing-mode: vertical-lr;
 }
-.sideways-rl {
-  writing-mode: sideways-rl;
+
+.flip {
+    -moz-transform: scale(-1, -1);
+-webkit-transform: scale(-1, -1);
+-o-transform: scale(-1, -1);
+-ms-transform: scale(-1, -1);
+transform: scale(-1, -1);
+}
+
+.vertical-rl {
+  writing-mode: vertical-rl;
 }
