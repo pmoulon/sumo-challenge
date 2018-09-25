@@ -1,5 +1,11 @@
-#!/usr/bin/env python3
-# Copyright 2004-present Facebook. All Rights Reserved.
+"""
+Copyright (c) Facebook, Inc. and its affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+
+Algorithm class: Evaluate a mesh track submission
+"""
 
 from easydict import EasyDict as edict
 import numpy as np
@@ -9,7 +15,22 @@ import sumo.utils as utils
 class Evaluator():
     """
     Base class for evaluating a submission.
-    
+
+    Do not instantiate objects of this class.  Instead, use one of the
+    track-specific sub-classes.
+
+    Configuration:
+    The algorithm is configured using the settings, which is an
+    EasyDict object.  Recognized keys:
+    thresholds (numpy vector of float) - values for IoU thresholds (tau) at
+      which the similarity will be measured.  Default 0.5 to 0.95 in
+      0.05 increments.
+    recall_samples (numpy vector of float) - recall values where PR
+      curve will be sampled for average precision computation.
+      Default 0 to 1 in 0.01 increments.
+    categories (list of string) - categories for which the semantic metric
+      should be evaluated.  Default: a small subset of the SUMO
+      evaluation categories (see default_settings)
     """
 
     def __init__(self, submission, ground_truth, settings=None):
@@ -27,17 +48,24 @@ class Evaluator():
         """
 
         self._settings = self.default_settings() if settings is None else settings
+        self._submission = submission
+        self._ground_truth = ground_truth
 
         # compute similarity between all detections and gt elements
         self._similarity_cache = self._make_similarity_cache(submission, ground_truth)
         
-        # compute data association (for all thresholds)
-        self._amodal_data_assoc = self._amodal_data_association(
-            submission, ground_truth, _settings.thresholds
+        # compute amodal and modal data association (for all thresholds)
+        self._amodal_data_assoc = self._amodal_data_assoc(
+            submission.elements, ground_truth.elements,
+            _settings.thresholds, self._similarity_cache
         )
 
-        #::: save submission and ground_truth
-   
+        self._modal_data_assoc = self._modal_data_assoc(
+            submission.elements, ground_truth.elements,
+            _settings.thresholds,
+            _settings.categories, self._similarity_cache
+        )
+        
 
     @staticmethod
     def default_settings(self):
@@ -47,12 +75,27 @@ class Evaluator():
 
         thresholds = np.linspace(0.5, 0.95, 10)
         recall_samples = np.linspace(0, 1, 101)
-                                                         
+        categories = ["wall", "chair"]
+        
         return edict({"thresholds": thresholds,
-                      "recall_samples": recall_samples})
-
+                      "recall_samples": recall_samples,
+                      "categories": categories
+        })
     
-    def shape_similarity(self):
+
+
+    def evaluate_all(self):
+        """
+        Computes all metrics for the submission.
+
+        Return:
+        dict with key: value pairs (keys are strings - values are corresponding evaluation 
+        metrics.  Exact keys depend on evaluation track.
+        """
+        raise NotImplementedError('Instantiate a child class')
+    
+
+    def shape_similarity_score(self):
         """
         Compute shape similarity score (Equation 6 in SUMO white paper)
 
@@ -66,6 +109,7 @@ class Evaluator():
         for t in self._settings.thresholds:
 
             # construct input needed for PR curve computation
+            # det_matches = 1 if correct detection, 0 if false positive
             det_matches = []
             det_scores = []
             for element in self._submission.elements:
@@ -125,7 +169,76 @@ class Evaluator():
         # Eqs. 7 and 9    
         return np.mean(rot_errors), np.mean(trans_errors)
 
+    def appearance_score(self):
+        """
+        Compute appeareance score for the submission.
 
+        Return:
+        float - appearance score (Equation 13 in SUMO white paper)
+        """
+        raise NotImplementedError('Instantiate a child class')
+
+
+    def semantics_score(self):
+        """
+        Compute semantic score for the submission.
+        Return:
+        semantic_score (float) - mean Average Precision (mean AP across classes)
+        of submission (Equation 15 in SUMO white paper)
+        """
+
+        # Initialize:
+        # n_gt[cat] = number of GT elements in that category
+        # det_matches[cat] = list of matches (1 for each detection).
+        #   Entry is 1 for a correct match, 0 for a false positive
+        # det_scores[cat] = list of detection scores (1 for each detection).
+        for cat in self._categories:
+            n_gt[cat] = 0
+            det_matches[cat] = []
+            det_scores[cat] = []
+        aps = []  # average precision list
+
+        # compute number of GT elements in each category
+        for element in self._submission.elements:
+            n_gt[element.category] += 1
+        
+        for t in self._settings.thresholds:
+
+            # build lists of matches per category
+            for element in self._submission.elements:
+                cat = element.category
+                if element.id in self._modal_data_assoc[t][cat]:
+                    det_matches[cat].append(1)  # correct detection
+                else:
+                    det_matches[cat].append(0)  # false positive
+                det_scores[cat].append(element.score)
+
+            # compute PR curve per category
+            for c in self._settings.categories:
+                (precision, _) = utils.compute_pr(
+                    det_matches, det_scores, n_gt,
+                    recall_samples = self._settings.recall_samples,
+                    interp=True)
+                aps.append(np.mean(precision))  # Equation 15
+        return np.mean(aps)  # Equation 16
+
+    
+    def evaluate_perceptual(self):
+        """
+        ::: need to fix
+            Computes perceptual score for a participant's submission
+            Args:
+                ground_truth: Ground-truth - list of ProjectObject instances
+                submission: Submission - list of ProjectObject instances
+            Returns:
+                perceptual_score: a list of 3 tuples [(s1, s1m), (s2, s2m),
+                (s3, s3m)] where s1, s2, s3 are layout, furniture and clutter
+                scores respectively and s1m, s2m, s3m are the maximum possible
+                scores for layout, furniture, and clutter respectively.
+        """
+        raise NotImplementedError('Instantiate a child class')
+
+    
 #------------------------
 # End of public interface
 #------------------------
@@ -159,10 +272,10 @@ class Evaluator():
 
     def _shape_similarity(self, element1, element2):
         """
-        Defines a similarity function that compares the shape of
-          <element1> and <element2>. 
+        Similarity function that compares the shape of <element1> and
+        <element2>.  
         The actual similarity function must be defined in
-        track-specific child classes.
+        track-specific child classes. 
 
         Inputs:
         element1 (ProjectObject)
@@ -173,24 +286,26 @@ class Evaluator():
         """
         raise NotImplementedError('Instantiate a child class')
 
-    def _amodal_data_association(self, submission, ground_truth, thresholds):
+    def _amodal_data_assoc(self, sub_elements, gt_elements, thresholds, sim_cache):
         """
         Computes amodal (category-independent) data association
         between the elements in <submission> and <ground_truth> for
         each similarity threshold in <thresholds>.
 
         Inputs:
+        sub_elements (ProjectObjectDict) - submitted scene elements
+        gt_elements (ProjectObjectDict) - corresponding ground truth
+          scene elements
         thresholds (list of float) - Similarity thresholds to be used.
+        sim_cache (dict of dict of Corrs) - similarity cache -
+          sim_cache[det_id][gt_id] is similarity between det_id and gt_id.
 
         Return:
-        data_association (dict of dicts of Corr) -
-        data_association[thresh][det_id], where thresh is taken from
+        data_assoc (dict of dicts of Corr) -
+        data_assoc[thresh][det_id], where thresh is taken from
         <thresholds> and det_id is a detection ID.  If a det_id is not
         in the dict, no correspondance was found.
         
-        Note:
-        self._similarity_cache must be already computed.
-
         Algorithm:
         1. Matches with similarity < thresh are eliminated from
         consideration.
@@ -204,7 +319,7 @@ class Evaluator():
         """
 
         # make copy of the cache that we can modify
-        sim_cache = self._similarity_cache.deep_copy()
+        sim_cache2 = sim_cache.deep_copy()
 
         # for storing results
         data_assoc = {}  # key is threshold
@@ -216,10 +331,10 @@ class Evaluator():
         for thresh in thresholds.sorted():
             
             # remove matches with similarity < thresh
-            for det_id in sim_cache.keys():
-                for gt_id, corr in sim_cache[det_id].iteritems():
+            for det_id in sim_cache2.keys():
+                for gt_id, corr in sim_cache2[det_id].iteritems():
                     if corr.simlarity < thresh:
-                        pop(sim_cache[det_id][gt_id])
+                        pop(sim_cache2[det_id][gt_id])
 
             # for tracking GT elements that have already been assigned
             # at this threshold
@@ -235,7 +350,7 @@ class Evaluator():
                 # make list of possible matches for this det_id and
                 # sort by similarity
                 possible_corrs = [
-                    corr for corr in sim_cache[det_id].values()
+                    corr for corr in sim_cache2[det_id].values()
                     if corr.gt_id not in assigned_gts]
                 sort_corrs_by_similarity(possible_corrs)
 
@@ -248,7 +363,72 @@ class Evaluator():
         return data_assoc
 
 
+    def _modal_data_assoc(self, sub_elements, gt_elements,
+                          thresholds, categories, sim_cache):
+        """
+        Computes modal (category-specific) data association
+        between the elements in <submission> and <ground_truth> for
+        each similarity threshold in <thresholds>.
 
+        Inputs:
+        sub_elements (ProjectObjectDict) - submitted scene elements
+        gt_elements (ProjectObjectDict) - corresponding ground truth
+          scene elements
+        thresholds (list of float) - Similarity thresholds to be used.
+        sim_cache (dict of dict of Corrs) - similarity cache -
+          sim_cache[det_id][gt_id] is similarity between det_id and gt_id.
+
+        Return:
+        data_assoc (dict of dicts of dicts of Corr) -
+        data_assoc[category][thresh][det_id], where thresh is taken from
+        <thresholds> and det_id is a detection ID.  If a det_id is not
+        in the dict, it means that no correspondance was found.
+        
+
+        Algorithm:
+        For each category C in category list (from settings):
+        1. Get a list of elements in submission and GT belonging to
+        that category;  If both lists are empty, we skip the category.
+        2. Construct submission and ground truth ProjectScenes using
+        only elements with category C.
+        3. Compute amodal data association using these subsets.
+
+        """
+
+        # Split detections and gt elements by category and store in
+        # dict of ProjectObjectDicts.  
+        dets_by_cat = {}
+        gts_by_cat = {}
+        for cat in categories:
+            dets_by_cat[cat] = ProjectObjectDict()
+            gts_by_cat[cat] = ProjectObjectDict()
+
+        for (id, element) in det_elements.items():
+            dets_by_cat[element.category][id] = element
+
+        for (id, element) in gt_elements.items():
+            gts_by_cat[element.category][id] = element
+
+
+        data_assoc = {}  # for storing results (key is category)
+
+        for cat in categories:
+            dets = dets_by_cat[cat]
+            gts = gts_by_cat[cat]
+            if (len(dets) + len(gts)) == 0:
+                continue
+
+            # build mini sim_cache
+            sim_cache_cat = {}
+            for det_id in dets.keys():
+                sim_cache_cat[det_id] = {}
+                for gt_id in gts.keys():
+                    sim_cache_cat[det_id][gt_id] = sim_cache[det_id][gt_id]
+
+            # do data association
+            data_assoc[cat] = self._amodal_data_assoc(dets, gts, thresholds, sim_cache_cat)
+
+        return data_assoc
 
     
 class Corr():
@@ -271,149 +451,12 @@ class Corr():
         """
         corrs.sort(key = lambda(corr): return corr.similarity)
 
-        
-#---------------  old code below here (need to revise)
 
 
     
-    def association(self, ground_truth, submission, thresh):
-        """
-        Associate instances in submission with instances in ground-truth
-        for evaluation.
 
-        1. Compute the shape similarity between all pairs of
-        predicted elements and ground truth elements (within a scene)
 
-        2. Sort the shape similarity scores in a descending order.
 
-        3. Choose the available pair with the largest shape similarity and
-        mark the two elements as unavailable.
-
-        4. Repeat step 3 until the shape similarity is lower than a threshold <thresh>.
-
-        Inputs:
-        ground_truth (list of ProjectObject) - Ground-truth objects for one scene.
-        submission (list of ProjectObject) - Submission objects for one scene.
-        thresh (float) -  shape similarity threshold for match (IoU measure)
-
-        Return:
-        tuple (matched, missed, extra) where
-        matched (dict) - maps ground truth object ids (keys) to
-            submission object ids (values) representing a match between a
-            ground-truth object and a submitted object.
-        missed (list) - object ids of non-matched ground-truth objects
-            (i.e., in GT but not in the submission)
-        extra (list) - object ids of non-matched detected objects
-            (i.e., in submission but not in GT)
-        """
-
-        Ngt = len(ground_truth)
-        Nsub = len(submission)
-        ssimilarity = np.zeros((Ngt, Nsub))
-        for i in range(Ngt):
-            for j in range(Nsub):
-                ssimilarity[i, j] = self._shape_similarity(
-                    ground_truth[i], submission[j])
-        assigned_gt, assigned_sub, missed, extra = [], [], [], []
-        matched = {}
-        for i in range(Ngt):
-            candidates = np.argsort(-ssimilarity[i, :])
-            for j in range(Nsub):
-                cand = candidates[j]
-                if cand not in assigned_sub and ssimilarity[i, cand] >= thresh:
-                    matched[i] = cand
-                    assigned_gt.append(i)
-                    assigned_sub.append(cand)
-                    break
-        missed = list(set(range(Ngt)) - set(assigned_gt))
-        extra = list(set(range(Nsub)) - set(assigned_sub))
-
-        return matched, missed, extra
-
-    def evaluate_geometry(self, ground_truth, submission):
-        """
-            Computes shape and pose score for a participant's submission
-            Args:
-                ground_truth: Ground-truth - list of ProjectObject instances
-                submission: Submission - list of ProjectObject instances
-            Returns:  :::fix order and return type
-                pose_score: (R_error, t_error) tuple representing average
-                rotation matrix geodesic distance, and translation error
-                shape_score: Average Precision (class-agnostic) of submission
-        """
-        shape_score = AP(self, ground_truth, submission)
-        pose_score = pose_error(self, ground_truth, submission)
-
-        return shape_score, pose_score
-
-    def evaluate_appearance(self, ground_truth, submission):
-        """
-            Computes appeareance score for a participant's submission
-            Args:
-                ground_truth: Ground-truth - list of ProjectObject instances
-                submission: Submission - list of ProjectObject instances
-            Returns:
-                appearance_score: appearance score of submission
-        """
-        raise NotImplementedError('Instantiate a child class')
-
-    def evaluate_semantics(self, ground_truth, submission):
-        """
-            Computes semantic score a participant's submission
-            Args:
-                ground_truth: Ground-truth - list of ProjectObject instances
-                submission: Submission - list of ProjectObject instances
-            Returns:
-                semantic_score: mean Average Precision (mean AP across classes)
-                of submission
-        """
-
-        semantic_score = mAP(self, ground_truth, submission)
-
-        return semantic_score
-
-    def evaluate_perceptual(self, ground_truth, submission):
-        """
-            Computes perceptual score for a participant's submission
-            Args:
-                ground_truth: Ground-truth - list of ProjectObject instances
-                submission: Submission - list of ProjectObject instances
-            Returns:
-                perceptual_score: a list of 3 tuples [(s1, s1m), (s2, s2m),
-                (s3, s3m)] where s1, s2, s3 are layout, furniture and clutter
-                scores respectively and s1m, s2m, s3m are the maximum possible
-                scores for layout, furniture, and clutter respectively.
-        """
-        raise NotImplementedError('Instantiate a child class')
-
-    def evaluate_all(self, ground_truth, submission):
-        """
-            Computes all metrics for a participant's submission
-            Args:
-                ground_truth: Ground-truth - list of ProjectObject instances
-                submission: Submission - list of ProjectObject instances
-            Returns:
-                dictionary containing geometry, appearance, semantics, and
-                perceptual metrics for submission
-        """
-        raise NotImplementedError('Instantiate a child class')
 
     
-    def _compute_category_agnostic_map(self):
-        """
-        """
-
-        aps = []  # list of average precisions (one per sim thresh)
-        for sim_thresh in range(self._settings.sim_thresh_start,
-                                self._settings.sim_thresh_end,
-                                self._settings.sim_thresh_step):
-            ap = self._compute_category_agnostic_ap(sim_thresh)
-            aps.append(ap)
-        return np.mean(aps)
-
-    def _compute_category_agnostic_ap(self, sim_thresh):
-        """
-        Compute the category agnostic average precision (eq. 4)
-        for a single similarity threshold (tau).
-        """
         

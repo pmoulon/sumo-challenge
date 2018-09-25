@@ -23,7 +23,7 @@ def matrix2quaternion(M):
     Inputs:
     M (numpy 3x3 array of float) - rotation matrix
 
-    Returns:
+    Return:
     q (numpy vector of float) -  quaternion in (w,i,j,k) order
 
     Source:
@@ -158,6 +158,95 @@ def plot_pr(precision, recall):
     return fig
 
 
+def voxel_or_points_iou(pv1, pv2, config):
+    """
+    Compute voxel or points intersection over union for two objects.
+    To compare the similarity between the mesh (resp voxel centers) of
+    object i and j, we define a point(resp voxel centers) IoU metric as
+    the ratio of overlapping mesh points (resp voxel centers) over the
+    total number of mesh points (resp voxel centers). An overlapping point
+    (resp voxel center) in element i is a point (resp voxel center) whose
+    center is within a small distance threshold of at least one other
+    point (resp voxel center) in element j
+
+    Args:
+    pv1, pv2: (N X 7) points or voxel centers for ProjectObject
+    instances whose shapes to compare
+    config.voxel_th: distance threshold expressed as number of voxels
+    config.voxel_size: Voxel Size
+    config.voxel_th * config.voxel_size is the distance
+    threshold for 2 points or voxel centers to be considered "the same"
+
+    Returns:
+    iou: points (resp voxel centers) intersection over union -
+    inter/union - where inter  = (n1 + n2) where n1/n2 is the number
+    of points (resp voxel centers of obj1/obj2 that are within the
+    threshold distance of another point(resp voxel center) of obj2/obj1
+    union is the total number of points(resp voxels centers) in obj1
+    and obj2
+    """
+    id1, id2, dist1, dist2 = nearest_neighbor(pv1, pv2)
+    inter1 = np.sum(dist1 <= config.voxel_size * config.voxel_th)
+    inter2 = np.sum(dist2 <= config.voxel_size * config.voxel_th)
+    inter = inter1 + inter2
+    union = id1.shape[0] + id2.shape[0]
+
+    return inter/union
+
+
+def nearest_neighbor(pv1, pv2):
+    """
+        Compute nearest neighbor of points from one set of points to the other
+        Args:
+            pv1, pv2: (N X 7) points or voxel centers
+        Returns:
+            id1, id2: (N,) id of nearest neighbor in other point set
+            dist1, dist2: (N,) corresponding distance to nearest neigbor for
+            each point
+
+    """
+    tree1 = BallTree(pv1[:, 0:3])
+    tree2 = BallTree(pv2[:, 0:3])
+    dist1, ind1 = tree2.query(pv1[:, 0:3])
+    dist2, ind2 = tree1.query(pv2[:, 0:3])
+    ind1 = ind1.flatten()
+    ind2 = ind2.flatten()
+    return ind1, ind2, dist1, dist2
+
+def sample_mesh(faces, density=5e2):
+    """ 
+    Sample points from a mesh surface using barycentric coordinates
+    
+    Inputs:
+    faces (np array - 3*N x 6) -  matrix representing vertices and faces with
+      X, Y, Z, R, G, B faces[0:3, :] is the first face. N is the number of faces
+    density (float) - Number of points per square meter
+
+    Return:
+    points (np array - N X 6 matrix of sampled points
+    """
+    A, B, C = faces[0::3, :], faces[1::3, :], faces[2::3, :]
+    cross = np.cross(A[:, 0:3] - C[:, 0:3] , B[:, 0:3] - C[:, 0:3])
+    areas = 0.5*(np.sqrt(np.sum(cross**2, axis=1)))
+
+    # ::: set minimum of 1 sample
+    Nsamples_per_face = (density*areas).astype(int)
+    N = np.sum(Nsamples_per_face)
+    #TODO: Remove after mesh reading bug is fixed
+    if N == 0:
+        return np.empty((0, 3))
+    face_ids = np.zeros((N,), dtype=int)
+    
+    count = 0
+    for i, n in enumerate(Nsamples_per_face):
+        face_ids[count:count + Nsamples_per_face[i]] = i
+        count += Nsamples_per_face[i]
+
+    A = A[face_ids, :]; B = B[face_ids, :]; C = C[face_ids, :]
+    r = np.random.uniform(0, 1, (N, 2))
+    sqrt_r1 = np.sqrt(r[:, 0:1])
+    points = (1 - sqrt_r1)*A + sqrt_r1*(1 - r[:, 1:])*B + sqrt_r1*r[:, 1:]*C
+    return points
 
 
 
@@ -166,7 +255,8 @@ def plot_pr(precision, recall):
 
 
 
-# :::Todo: move these routines to DataAssociation class
+
+# :::not used
 def category_filter_matched(matched, ground_truth, submission, category):
     """
         Filter matches by keeping only dictionary elements for which
@@ -282,6 +372,7 @@ def mAP(evaluator, ground_truth, submission):
     return np.mean(APs)
 
 
+
 def oriented_box2mesh(obj):
     """
         Represents the 3D bounding box of an object as a mesh object
@@ -306,33 +397,6 @@ def oriented_box2mesh(obj):
 
     return boxmesh
 
-def sample_mesh(faces, POINT_DENSITY=5e2):
-    """ Sample points from a mesh surface using barycentric coordinates
-    ¦   Args:
-    ¦   ¦   faces : 3*N x 6 matrix representing vertices and faces with
-    ¦   ¦   X, Y, Z, R, G, B faces[0:3, :] is the first face
-            POINT_DENSITY: Number of points per unit surface
-        Returns:
-            points: N X 6 matrix of sampled points
-    """
-    A, B, C = faces[0::3, :], faces[1::3, :], faces[2::3, :]
-    cross = np.cross(A[:, 0:3] - C[:, 0:3] , B[:, 0:3] - C[:, 0:3])
-    areas = 0.5*(np.sqrt(np.sum(cross**2, axis=1)))
-    Nsamples_per_face = (POINT_DENSITY*areas).astype(int)
-    N = np.sum(Nsamples_per_face)
-    #TODO: Remove after mesh reading bug is fixed
-    if N == 0:
-        return np.empty((0, 3))
-    face_ids = np.zeros((N,), dtype=int)
-    count = 0
-    for i, n in enumerate(Nsamples_per_face):
-        face_ids[count:count + Nsamples_per_face[i]] = i
-        count += Nsamples_per_face[i]
-    A = A[face_ids, :]; B = B[face_ids, :]; C = C[face_ids, :]
-    r = np.random.uniform(0, 1, (N, 2))
-    sqrt_r1 = np.sqrt(r[:, 0:1])
-    points = (1 - sqrt_r1)*A + sqrt_r1*(1 - r[:, 1:])*B + sqrt_r1*r[:, 1:]*C
-    return points
 
 def voxelize_points(points, config, min_xyz, max_xyz):
     """ Voxelize point cloud
@@ -423,58 +487,7 @@ def get_obj_points_and_voxels(obj, config, with_voxels=False):
     return obj
 
 
-def voxel_or_points_iou(pv1, pv2, config):
-    """
-        Compute voxel or points intersection over union for two objects.
-        To compare the similarity between the mesh (resp voxel centers) of
-        object i and j, we define a point(resp voxel centers) IoU metric as
-        the ratio of overlapping mesh points (resp voxel centers) over the
-        total number of mesh points (resp voxel centers). An overlapping point
-        (resp voxel center) in element i is a point (resp voxel center) whose
-        center is within a small distance threshold of at least one other
-        point (resp voxel center) in element j
-        Args:
-            pv1, pv2: (N X 7) points or voxel centers for ProjectObject
-            instances whose shapes to compare
-            config.voxel_th: distance threshold expressed as number of voxels
-            config.voxel_size: Voxel Size
-            config.voxel_th * config.voxel_size is the distance
-            threshold for 2 points or voxel centers to be considered "the same"
-        Returns:
-            iou: points (resp voxel centers) intersection over union -
-            inter/union - where inter  = (n1 + n2) where n1/n2 is the number
-            of points (resp voxel centers of obj1/obj2 that are within the
-            threshold distance of another point(resp voxel center) of obj2/obj1
-            union is the total number of points(resp voxels centers) in obj1
-            and obj2
 
-    """
-    id1, id2, dist1, dist2 = nearest_neighbor(pv1, pv2)
-    inter1 = np.sum(dist1 <= config.voxel_size * config.voxel_th)
-    inter2 = np.sum(dist2 <= config.voxel_size * config.voxel_th)
-    inter = inter1 + inter2
-    union = id1.shape[0] + id2.shape[0]
-
-    return inter/union
-
-def nearest_neighbor(pv1, pv2):
-    """
-        Compute nearest neighbor of points from one set of points to the other
-        Args:
-            pv1, pv2: (N X 7) points or voxel centers
-        Returns:
-            id1, id2: (N,) id of nearest neighbor in other point set
-            dist1, dist2: (N,) corresponding distance to nearest neigbor for
-            each point
-
-    """
-    tree1 = BallTree(pv1[:, 0:3])
-    tree2 = BallTree(pv2[:, 0:3])
-    dist1, ind1 = tree2.query(pv1[:, 0:3])
-    dist2, ind2 = tree1.query(pv2[:, 0:3])
-    ind1 = ind1.flatten()
-    ind2 = ind2.flatten()
-    return ind1, ind2, dist1, dist2
 
 def points_rmsd(evaluator, ground_truth, submission, use_voxels):
     """
@@ -559,30 +572,6 @@ def color_rmsd(evaluator, ground_truth, submission, use_voxels):
     return np.mean(rmsd_IoU)
 
 
-def bb_iou(obj1, obj2):
-    """
-        Compute intersection over union of bounding boxes for two objects.
-        Args:
-            obj1, obj2: ProjectObject instances
-        Returns:
-            volumetric bounding box intersection over union
-    """
-    box1 = oriented_box2mesh(obj1)
-    box2 = oriented_box2mesh(obj2)
-    inter = pymesh.boolean(box1, box2, operation='intersection', engine='cgal')
-    ivert, ifaces, _ = remove_duplicated_vertices_raw(inter.vertices, inter.faces)
-    inter = pymesh.form_mesh(ivert, ifaces)
-    visualize = False
-    if visualize:
-        to_surface(box1).plot('r')
-        to_surface(box2).plot('g')
-        to_surface(inter).plot('b')
-        plt.show()
-        plt.waitforbuttonpress()
-        plt.close()
-    inter = abs(inter.volume)
-    union = abs(box1.volume) + abs(box2.volume) - inter
-    return inter/union
 
 
 def to_surface(mesh):
