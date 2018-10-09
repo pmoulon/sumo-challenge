@@ -7,6 +7,10 @@ LICENSE file in the root directory of this source tree.
 Algorithm class: Evaluate a mesh track submission
 """
 
+import numpy as np
+import pymesh
+from pymesh.meshutils import remove_duplicated_vertices_raw
+
 from sumo.metrics.Evaluator import Evaluator
 
 class BBEvaluator(Evaluator):
@@ -14,7 +18,7 @@ class BBEvaluator(Evaluator):
     Algorithm to evaluate a submission for the bounding box track.
     """
 
-    def __init__(self, submission, ground_truth, settings):
+    def __init__(self, submission, ground_truth, settings=None):
         """
         Constructor.  Computes similarity between all elements in the
         submission and ground_truth and also computes amodal and modal
@@ -42,7 +46,7 @@ class BBEvaluator(Evaluator):
         """
         raise NotImplementedError('Instantiate a child class')
 
-    def evaluate_all(self)
+    def evaluate_all(self):
         """
         Computes all metrics for the submission
 
@@ -84,11 +88,11 @@ class BBEvaluator(Evaluator):
         Return:
         float - bounding box IoU (Equation 1 in SUMO white paper)
         """
-        box1 = _element2pymesh(element1)
-        box2 = _element2pymesh(element2)
-        intersect = pymesh.boolean(box1, box2, operation='intersection', engine='cgal')
+        box1 = _bbox2pymesh(element1)
+        box2 = _bbox2pymesh(element2)
+        inter = pymesh.boolean(box1, box2, operation='intersection', engine='cgal')
         ivert, ifaces, _ = remove_duplicated_vertices_raw(inter.vertices, inter.faces)
-        inter = pymesh.form_mesh(ivert, ifaces)
+        inter_mesh = pymesh.form_mesh(ivert, ifaces)
         # ::: Remove debugging code
         # visualize = False
         # if visualize:
@@ -98,13 +102,17 @@ class BBEvaluator(Evaluator):
         #     plt.show()
         #     plt.waitforbuttonpress()
         #     plt.close()
-        intersect = abs(inter.volume)  # ::: why is abs needed here?
-        union = abs(box1.volume) + abs(box2.volume) - intersect
-        return intersect/union
+        
+        # Note: pymesh may give -volume depending on surface normals
+        # or maybe vertex ordering 
+        intersection = abs(inter_mesh.volume)  
+        union = abs(box1.volume) + abs(box2.volume) - intersection
+#        print("Computing BB similarity: I: {} | U: {} | IOU: {}".format(intersection, union, intersection / union))
+        return intersection / union
 
 
     
-def _element2pymesh(element):
+def _bbox2pymesh(element):
     """
     Convert the bounding box of <element> into a pymesh Mesh in world coordinates.
 
@@ -115,6 +123,11 @@ def _element2pymesh(element):
     pymesh.Mesh - Mesh representation of the oriented bounding box in
       world coordinates.
     """
-    sumo_mesh = element.bounds.to_mesh() * element.pose
-    return pymesh.form_mesh(sumo_mesh.vertices(),
-                            np.reshape(sumo_mesh.indices(), [-1, 3]))
+    vertices = (element.pose * element.bounds.corners())
+    
+    i1, i2, i3, i4, i5, i6, i7, i8 = range(8)
+    faces = [[i1, i2, i3], [i1, i3, i4], [i4, i3, i8], [i4, i8, i5],
+             [i5, i8, i7], [i5, i7, i6], [i6, i7, i2], [i6, i2, i1],
+             [i1, i4, i5], [i1, i5, i6], [i2, i7, i8], [i2, i8, i3]]
+
+    return pymesh.form_mesh(vertices.T, np.array(faces))

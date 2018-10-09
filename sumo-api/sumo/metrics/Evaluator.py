@@ -7,10 +7,16 @@ LICENSE file in the root directory of this source tree.
 Algorithm class: Evaluate a mesh track submission
 """
 
+from copy import deepcopy
 from easydict import EasyDict as edict
+import math
 import numpy as np
+from scipy.linalg import logm
 
-import sumo.utils as utils
+from sumo.geometry.rot3 import Rot3
+import sumo.metrics.utils as utils
+from sumo.semantic.project_object_dict import ProjectObjectDict
+from sumo.semantic.object_symmetry import SymmetryType
 
 class Evaluator():
     """
@@ -24,7 +30,7 @@ class Evaluator():
     EasyDict object.  Recognized keys:
     thresholds (numpy vector of float) - values for IoU thresholds (tau) at
       which the similarity will be measured.  Default 0.5 to 0.95 in
-      0.05 increments.
+      0.05 increments.  Thresholds will be sorted in increasing order.
     recall_samples (numpy vector of float) - recall values where PR
       curve will be sampled for average precision computation.
       Default 0 to 1 in 0.01 increments.
@@ -46,29 +52,31 @@ class Evaluator():
         settings (EasyDict) - configuration for the evaluator.  See top of
           file for recognized keys and values.  
         """
-
+#        print("Evaluator constructor")
+        
         self._settings = self.default_settings() if settings is None else settings
+        self._settings.thresholds = np.sort(self._settings.thresholds)
         self._submission = submission
         self._ground_truth = ground_truth
 
         # compute similarity between all detections and gt elements
         self._similarity_cache = self._make_similarity_cache(submission, ground_truth)
-        
+
         # compute amodal and modal data association (for all thresholds)
-        self._amodal_data_assoc = self._amodal_data_assoc(
+        self._amodal_data_assoc = self._compute_amodal_data_assoc(
             submission.elements, ground_truth.elements,
-            _settings.thresholds, self._similarity_cache
+            self._settings.thresholds, self._similarity_cache
         )
 
-        self._modal_data_assoc = self._modal_data_assoc(
+        self._modal_data_assoc = self._compute_modal_data_assoc(
             submission.elements, ground_truth.elements,
-            _settings.thresholds,
-            _settings.categories, self._similarity_cache
+            self._settings.thresholds,
+            self._settings.categories, self._similarity_cache
         )
-        
+
 
     @staticmethod
-    def default_settings(self):
+    def default_settings():
         """
         Create and return an EasyDict containing default settings.
         """
@@ -112,7 +120,7 @@ class Evaluator():
             # det_matches = 1 if correct detection, 0 if false positive
             det_matches = []
             det_scores = []
-            for element in self._submission.elements:
+            for element in self._submission.elements.values():
                 if element.id in self._amodal_data_assoc[t]:
                     det_matches.append(1)  # correct detection
                 else:
@@ -120,10 +128,11 @@ class Evaluator():
                 det_scores.append(element.score)
                 
             (precision, _) = utils.compute_pr(
-                det_matches, det_scores, n_gt,
+                det_matches = np.array(det_matches),
+                det_scores = np.array(det_scores),
+                n_gt = n_gt,
                 recall_samples = self._settings.recall_samples,
-                interp=True
-            )
+                interp=True)
 
             aps.append(np.mean(precision))  # Equation 4
         return np.mean(aps)   # Equation 6
@@ -142,6 +151,9 @@ class Evaluator():
         (rotation_error, translation_error) - where
         rotation_error (float) - Equation 7 in SUMO white paper
         translation_error (float) - Equation 9 in sumo paper
+
+        Note: If submission has no correspondences with any ground truth objects,
+        return value is (None, None) and the error is not defined.
         """
         
         rot_errors = []
@@ -149,25 +161,112 @@ class Evaluator():
 
         for t in self._settings.thresholds:
             rot_errors1, trans_errors1 = [], []
-            for corr in self._amodal_data_assoc[t].itervalues():
+            for corr in self._amodal_data_assoc[t].values():
                 det_element = self._submission.elements[corr.det_id]
                 gt_element = self._ground_truth.elements[corr.gt_id]
 
-                q_gt = utils.matrix2quaternion(gt_element.pose.R.R)
-                q_det = utils.matrix2quaternion(det_element.pose.R.R)
                 #  Eq. 8
-                rot_errors1.append(np.sqrt(1/2.0) *
-                                  LA.norm(np.log(np.dot(q_gt, q_det.T))))
+                rot_errors1.append(self.rotation_error_1(det_element, gt_element))
                 # Eq. 10
-                trans_errors1.append(
-                    LA.norm(gt_element.pose.t - det_element.pose.t)
-                )
-                
-            rot_errors.append(np.mean(rot_errors1))
-            trans_errors.append(np.mean(trans_errors1))
+                trans_errors1.append(np.linalg.norm(gt_element.pose.t - det_element.pose.t))
 
-        # Eqs. 7 and 9    
-        return np.mean(rot_errors), np.mean(trans_errors)
+            if len(rot_errors1) > 0:
+                rot_errors.append(np.mean(rot_errors1))
+                trans_errors.append(np.mean(trans_errors1))
+
+            
+        # Eqs. 7 and 9
+        if len(rot_errors) == 0:
+            return (None, None)
+        else:
+            return np.mean(rot_errors), np.mean(trans_errors)
+
+
+    def rotation_error_1(self, det_element, gt_element):
+        """
+        Compute rotation error between <det_element> and <gt_element>.
+
+        Inputs:
+        det_element (ProjectObject) - detected element
+        gt_element (ProjectObject) - ground truth element
+
+        Return:
+        float - rotation error metric (Eq. 8)
+        """
+        print("rotation_error_1")
+        sym_list = [gt_element.symmetry.x_symmetry,
+                    gt_element.symmetry.y_symmetry,
+                    gt_element.symmetry.z_symmetry]
+
+        det_rot = det_element.pose.R  # Rot3 
+        
+        # collect a list of equvalent rots for the target object in rots_to_check
+        print("id = " + gt_element.id)
+        rots_to_check = [gt_element.pose.R]
+        for (axis, sym) in enumerate(sym_list):
+            if sym == SymmetryType.spherical:
+                # spherical means 0 error
+                return 0
+            elif sym == SymmetryType.twoFold:
+                rots_to_check.extend(
+                    [self.symmetric_rot(rot, axis, math.pi) for rot in rots_to_check])
+            elif sym == SymmetryType.fourFold:
+                new_rots = [self.symmetric_rot(rot, axis, 0.5 * math.pi) for rot in rots_to_check]
+                new_rots.extend([self.symmetric_rot(rot, axis, math.pi) for rot in rots_to_check])
+                new_rots.extend([self.symmetric_rot(rot, axis, 1.5 * math.pi) for rot in rots_to_check])
+                rots_to_check.extend(new_rots)
+            elif sym == SymmetryType.cylindrical:
+                rots_to_check = [self.cylindrical_symmetric_rot(det_element.pose.R, rot, axis) for rot in rots_to_check]
+            # else sym = SymmetryType.none -> do nothing
+
+        print("rots_to_check = {}".format(rots_to_check))
+        # get minimum error
+        # Eq. 8, source: https://chrischoy.github.io/research/measuring-rotation/
+        errors = [np.sqrt(0.5) *
+                  np.linalg.norm(logm(np.matmul(det_element.pose.R.R.T, gt_rot.R)))
+                  for gt_rot in rots_to_check]
+        print("errors = {}".format(errors))
+        
+        return min(errors)
+
+    
+    def symmetric_rot(self, rot, axis, rotation):
+        """
+        Pre-rotate <rot> by <rotation> radians about <axis>.
+
+        Inputs:
+        rot (Rot3) - original rotation
+        axis (int) - rotation axis to use (0=x, 1=y, 2=z)
+        rotation (float) - rotation amount (radians)
+        """
+        axis_rot_func = [Rot3.Rx, Rot3.Ry, Rot3.Rz]
+        return rot * axis_rot_func[axis](rotation)
+
+    
+    def cylindrical_symmetric_rot(self, det_rot, gt_rot, axis):
+        """
+        Compute rot that zeroes out the rotation error between 
+        <det_rot> and <gt_rot> along axis <axis>.
+
+        Inputs
+        det_rot (Rot3) - rotation for detection
+        gt_rot (Rot3) - rotation for ground truth
+        axis (int) - cylindrical rotation axis (0=x, 1=y, 2=z)
+
+        Return:
+        Rot3 - new rotation matrix with gt set to det rotation on target axis
+
+        Algorithm: 
+        1. convert to zyx Euler angles
+        2. set gt to detection value for target axis
+        3. convert back to matrix rep
+        """
+        det_euler = utils.matrix_to_euler(det_rot.R)
+        gt_euler = utils.matrix_to_euler(gt_rot.R)
+        # note e[0] is z
+        det_euler[2 - axis] = gt_euler[2 - axis]
+        return Rot3(utils.euler_to_matrix(det_euler))
+        
 
     def appearance_score(self):
         """
@@ -187,36 +286,51 @@ class Evaluator():
         of submission (Equation 15 in SUMO white paper)
         """
 
+            
         # Initialize:
-        # n_gt[cat] = number of GT elements in that category
-        # det_matches[cat] = list of matches (1 for each detection).
-        #   Entry is 1 for a correct match, 0 for a false positive
-        # det_scores[cat] = list of detection scores (1 for each detection).
-        for cat in self._categories:
-            n_gt[cat] = 0
-            det_matches[cat] = []
-            det_scores[cat] = []
-        aps = []  # average precision list
+        # aps = average precision list (1 per category)
+        aps = []  
 
         # compute number of GT elements in each category
-        for element in self._submission.elements:
-            n_gt[element.category] += 1
-        
+        # n_gt[cat] = number of GT elements in that category
+        n_gt = {}
+        for cat in self._settings.categories:
+            n_gt[cat] = 0
+        for element in self._submission.elements.values():
+            if element.category in self._settings.categories:
+                n_gt[element.category] += 1
+
         for t in self._settings.thresholds:
+            # det_matches[cat] = list of matches (1 for each detection).
+            det_matches = {}
+            #   Entry is 1 for a correct match, 0 for a false positive
+            # det_scores[cat] = list of detection scores (1 for each detection).
+            det_scores = {}
 
+            # initialize
+            for cat in self._settings.categories:
+                det_matches[cat] = []
+                det_scores[cat] = []
+            
             # build lists of matches per category
-            for element in self._submission.elements:
+            for element in self._submission.elements.values():
                 cat = element.category
-                if element.id in self._modal_data_assoc[t][cat]:
-                    det_matches[cat].append(1)  # correct detection
-                else:
-                    det_matches[cat].append(0)  # false positive
-                det_scores[cat].append(element.score)
-
+                if cat in self._settings.categories:
+                    if element.id in self._modal_data_assoc[cat][t]:
+                        det_matches[cat].append(1)  # correct detection
+#                        print("correct detection")
+                    else:
+                        det_matches[cat].append(0)  # false positive
+#                        print("false positive")
+                    det_scores[cat].append(element.score)
+            
+            
             # compute PR curve per category
             for c in self._settings.categories:
                 (precision, _) = utils.compute_pr(
-                    det_matches, det_scores, n_gt,
+                    det_matches = np.array(det_matches[c]),
+                    det_scores = np.array(det_scores[c]),
+                    n_gt = n_gt[c],
                     recall_samples = self._settings.recall_samples,
                     interp=True)
                 aps.append(np.mean(precision))  # Equation 15
@@ -260,14 +374,16 @@ class Evaluator():
         """
 
         sim_cache = {}
-        for det_element in submission.elements:
+        for det_element in submission.elements.values():
             det_id = det_element.id
             sim_cache[det_id] = {}
             det_score = det_element.score
-            for gt_element in ground_truth.elements:
-                corr = Corr(det_id, gt_element.id, det_score,
-                            self._shape_similarity(sub_element, gt_element))
-                sim_cache[det_id][gt_id] = corr
+            for gt_element in ground_truth.elements.values():
+                corr = Corr(det_id = det_id,
+                            gt_id = gt_element.id,
+                            similarity = self._shape_similarity(det_element, gt_element),
+                            det_score = det_score)
+                sim_cache[det_id][gt_element.id] = corr
         return sim_cache
 
     def _shape_similarity(self, element1, element2):
@@ -286,17 +402,17 @@ class Evaluator():
         """
         raise NotImplementedError('Instantiate a child class')
 
-    def _amodal_data_assoc(self, sub_elements, gt_elements, thresholds, sim_cache):
+    def _compute_amodal_data_assoc(self, det_elements, gt_elements, thresholds, sim_cache):
         """
         Computes amodal (category-independent) data association
         between the elements in <submission> and <ground_truth> for
         each similarity threshold in <thresholds>.
 
         Inputs:
-        sub_elements (ProjectObjectDict) - submitted scene elements
+        det_elements (ProjectObjectDict) - submitted/detected scene elements
         gt_elements (ProjectObjectDict) - corresponding ground truth
           scene elements
-        thresholds (list of float) - Similarity thresholds to be used.
+        thresholds (numpy vector of float) - Similarity thresholds to be used.
         sim_cache (dict of dict of Corrs) - similarity cache -
           sim_cache[det_id][gt_id] is similarity between det_id and gt_id.
 
@@ -319,7 +435,7 @@ class Evaluator():
         """
 
         # make copy of the cache that we can modify
-        sim_cache2 = sim_cache.deep_copy()
+        sim_cache2 = deepcopy(sim_cache)
 
         # for storing results
         data_assoc = {}  # key is threshold
@@ -328,13 +444,17 @@ class Evaluator():
         # Note: This allows us to reuse edits to similarity cache,
         # since any putative matches ruled out for a given threshold
         # will also be ruled out for higher thresholds.
-        for thresh in thresholds.sorted():
+        print("Amodal DA")
+        for thresh in thresholds:
+            print("thresh: {}".format(thresh))
+            data_assoc[thresh] = {}
             
             # remove matches with similarity < thresh
             for det_id in sim_cache2.keys():
-                for gt_id, corr in sim_cache2[det_id].iteritems():
-                    if corr.simlarity < thresh:
-                        pop(sim_cache2[det_id][gt_id])
+                for gt_id in list(sim_cache2[det_id].keys()):
+                    if sim_cache2[det_id][gt_id].similarity < thresh:
+                        print("Removing from cache: det: {}, gt: {} with sim: {}".format(det_id, gt_id, sim_cache2[det_id][gt_id].similarity))
+                        sim_cache2[det_id].pop(gt_id)
 
             # for tracking GT elements that have already been assigned
             # at this threshold
@@ -342,20 +462,23 @@ class Evaluator():
             
             # iterate over detections sorted in descending order of
             # score.
-            for det_id, _ in sorted(
-                    submission.iteritems(), 
-                    key = lambda(id, element): return element.score,
+            for det_element in sorted(
+                    det_elements.values(), 
+                    key = lambda element: element.score,
                     reverse = True):
-
+                det_id = det_element.id
+                
                 # make list of possible matches for this det_id and
                 # sort by similarity
                 possible_corrs = [
                     corr for corr in sim_cache2[det_id].values()
                     if corr.gt_id not in assigned_gts]
                 sort_corrs_by_similarity(possible_corrs)
-
+#                print("num possible corrs: " + str(len(possible_corrs)))
+                
                 # create match with last corr in list
                 if len(possible_corrs) > 0:
+                    print("Associating: det: {}  gt: {}".format(det_id, possible_corrs[-1].gt_id))
                     data_assoc[thresh][det_id] = possible_corrs[-1]
                     assigned_gts[possible_corrs[-1].gt_id] = det_id
                 # else no match for this det_id
@@ -363,18 +486,18 @@ class Evaluator():
         return data_assoc
 
 
-    def _modal_data_assoc(self, sub_elements, gt_elements,
-                          thresholds, categories, sim_cache):
+    def _compute_modal_data_assoc(self, det_elements, gt_elements,
+                                  thresholds, categories, sim_cache):
         """
         Computes modal (category-specific) data association
         between the elements in <submission> and <ground_truth> for
         each similarity threshold in <thresholds>.
 
         Inputs:
-        sub_elements (ProjectObjectDict) - submitted scene elements
+        det_elements (ProjectObjectDict) - submitted/detected scene elements
         gt_elements (ProjectObjectDict) - corresponding ground truth
           scene elements
-        thresholds (list of float) - Similarity thresholds to be used.
+        thresholds (numpy vector of float) - Similarity thresholds to be used.
         sim_cache (dict of dict of Corrs) - similarity cache -
           sim_cache[det_id][gt_id] is similarity between det_id and gt_id.
 
@@ -396,7 +519,9 @@ class Evaluator():
         """
 
         # Split detections and gt elements by category and store in
-        # dict of ProjectObjectDicts.  
+        # dict of ProjectObjectDicts.
+        print("Modal DA")
+        
         dets_by_cat = {}
         gts_by_cat = {}
         for cat in categories:
@@ -404,33 +529,48 @@ class Evaluator():
             gts_by_cat[cat] = ProjectObjectDict()
 
         for (id, element) in det_elements.items():
-            dets_by_cat[element.category][id] = element
+            if element.category in categories:
+                dets_by_cat[element.category][id] = element
 
         for (id, element) in gt_elements.items():
-            gts_by_cat[element.category][id] = element
+            if element.category in categories:
+                gts_by_cat[element.category][id] = element
 
 
         data_assoc = {}  # for storing results (key is category)
 
         for cat in categories:
+            print("category = " + cat)
+             
             dets = dets_by_cat[cat]
             gts = gts_by_cat[cat]
             if (len(dets) + len(gts)) == 0:
                 continue
 
-            # build mini sim_cache
+            # build mini sim_cache just for this category
             sim_cache_cat = {}
             for det_id in dets.keys():
                 sim_cache_cat[det_id] = {}
                 for gt_id in gts.keys():
-                    sim_cache_cat[det_id][gt_id] = sim_cache[det_id][gt_id]
+                    if gt_id in sim_cache[det_id]:
+                        sim_cache_cat[det_id][gt_id] = sim_cache[det_id][gt_id]
 
             # do data association
-            data_assoc[cat] = self._amodal_data_assoc(dets, gts, thresholds, sim_cache_cat)
+#            print("sim cache =")
+#            self._print_sim_cache(sim_cache_cat)
+            data_assoc[cat] = self._compute_amodal_data_assoc(dets, gts, thresholds, sim_cache_cat)
 
+#        print("------")
         return data_assoc
 
-    
+
+    def _print_sim_cache(self, sim_cache):
+        for det_id in sim_cache.keys():
+            for gt_id in sim_cache[det_id].keys():
+                corr = sim_cache[det_id][gt_id]
+                print("Det: {} | GT: {} | sim: {} | score: {}".format(det_id, gt_id, corr.similarity, corr.det_score))
+
+                
 class Corr():
     """
     Helper class for storing a correspondence.
@@ -442,14 +582,14 @@ class Corr():
         self.similarity = similarity
         self.det_score = det_score
 
-    def sort_corrs_by_similarity(corrs):
-        """
-        Sort a list of correspondences by similarity.  Sort is in place.
-        
-        Inputs:
-        corrs (list of Corr) - correspondences to sort.
-        """
-        corrs.sort(key = lambda(corr): return corr.similarity)
+def sort_corrs_by_similarity(corrs):
+    """
+    Sort a list of correspondences by similarity.  Sort is in place.
+
+    Inputs:
+    corrs (list of Corr) - correspondences to sort.
+    """
+    corrs.sort(key = lambda corr: corr.similarity)
 
 
 

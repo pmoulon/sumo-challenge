@@ -1,22 +1,27 @@
 """
     Metrics helper functions
 """
+
+import math
+import numpy as np
+
+from sumo.geometry.rot3 import Rot3
+
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import pymesh
 from pymesh.meshutils import remove_duplicated_vertices_raw
 import pyny3d.geoms as pyny
-import numpy as np
 from numpy import linalg as LA
 from sympy.geometry import Point, Segment
 from sklearn.neighbors import BallTree
 from collections import defaultdict
 from scipy import stats
 
-from sumo.metrics.voxelize_cpu import voxelize
+#from sumo.metrics.voxelize_cpu import voxelize
 
-def matrix2quaternion(M):
+def matrix_to_quat(M):
     """
     Transform a 3X3 Rotation matrix to a unit quaternion.
 
@@ -32,7 +37,7 @@ def matrix2quaternion(M):
     """
     m00, m01, m02 = M[0, :]
     m10, m11, m12 = M[1, :]
-    m20, m21, m22 = M[1, :]
+    m20, m21, m22 = M[2, :]
     tr = m00 + m11 + m22
 
     if tr > 0:
@@ -62,6 +67,105 @@ def matrix2quaternion(M):
     D = np.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
     return np.array([qw/D, qx/D, qy/D, qz/D])
 
+
+def quat_to_matrix(quat):
+    """
+    Convert quaternion to rotation matrix
+
+    Inputs:
+    quat (numpy vector of float) - quaternion in (w,i,j,k) order
+
+    Return
+    M (numpy 3x3 array of float) - rotation matrix
+
+    https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation
+    """
+
+    q = math.sqrt(2.0) * quat
+    q = np.outer(q, q)
+    return np.array([[1 - q[2,2] - q[3,3], q[1,2] - q[3,0], q[1,3] + q[2,0]],
+                        [q[1,2] + q[3,0], 1.0 - q[1,1] - q[3,3], q[2,3] - q[1,0]],
+                        [q[1,3] - q[2,0], q[2,3] + q[1,0], 1.0 - q[1,1] - q[2,2]]])
+    
+def quat_to_euler(q):
+    """
+    Convert quaternion to static ZYX Euler angle representation (i.e., R = R(z)*R(y)*R(x))
+    
+    Inputs:
+    q (numpy vector of float) - quaternion in (w,i,j,k) order
+    
+    Return:
+    numpy vector of float - Euler angles in radians (z, y, x)
+    
+    Source: matlab quat2eul
+    eul = [ atan2( 2*(qx.*qy+qw.*qz), qw.^2 + qx.^2 - qy.^2 - qz.^2 ), ...
+    asin( -2*(qx.*qz-qw.*qy) ), ...
+    atan2( 2*(qy.*qz+qw.*qx), qw.^2 - qx.^2 - qy.^2 + qz.^2 )];
+    
+    """
+    return np.array([math.atan2(2 * (q[1] * q[2] + q[0] * q[3]),
+                                q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3]),
+                     math.asin(-2 * (q[1] * q[3] - q[0] * q[2])),
+                     math.atan2(2 * (q[2] * q[3] + q[0] * q[1]),
+                                q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3])])
+
+
+def euler_to_quat(e):
+    """
+    Convert ZYX euler angles to quaternion
+
+    Inputs:
+    e (numpy vector of float) - Euler angles in radians (z, y, x)
+
+    Return:
+    q (numpy vector of float) - quaternion in (w,i,j,k) order
+    """
+    cz = math.cos(0.5 * e[0])
+    sz = math.sin(0.5 * e[0])
+    cy = math.cos(0.5 * e[1])
+    sy = math.sin(0.5 * e[1])
+    cx = math.cos(0.5 * e[2])
+    sx = math.sin(0.5 * e[2])
+
+    return np.array([cz * cy * cx + sz * sy * sx,
+		     cz * cy * sx - sz * sy * cx,
+		     cz * sy * cx + sz * cy * sx,
+                     sz * cy * cx - cz * sy * sx])
+    
+
+def euler_to_matrix(e):
+    """
+    Convert ZYX Euler angles to 3x3 rotation matrix.
+
+    Inputs:
+    e (numpy 3-vector of float) - ZYX Euler angles (radians)
+
+    Return:
+    matrix (3x3 numpy array2 of float) - rotation matrix
+
+    TODO: This could be optimized somewhat by using the direct
+    equations for the final matrix rather than multiplying out the 
+    matrices.
+    """
+    return (Rot3.Rz(e[0]) * Rot3.Ry(e[1]) * Rot3.Rx(e[2])).R
+
+def matrix_to_euler(matrix):
+    """
+    Convert 3x3 matrix to ZYX Euler angles.
+    
+    Inputs:
+    matrix (numpy 3x3 numpy array2 of float) - rotation matrix
+
+    Return:
+    numpy 3-vector of float - ZYX Euler angles (radians)
+
+    TODO:
+    This could be written more efficiently going directly between
+    matrix and Euler angles, but there are singularities and issues
+    with numerical stability to be considered.
+    """
+    return quat_to_euler(matrix_to_quat(matrix))
+    
 
 def compute_pr(det_matches, det_scores, n_gt, recall_samples=None, interp=False):
     """
@@ -95,9 +199,9 @@ def compute_pr(det_matches, det_scores, n_gt, recall_samples=None, interp=False)
     tps = np.not_equal(sorted_matches, 0)
     fps = np.equal(sorted_matches, 0)
 
-    print(tps)
-    print(fps)
-    print(sorted_matches)
+#    print(tps)
+#    print(fps)
+#    print(sorted_matches)
     # compute basic PR curve
     tp_sum = np.cumsum(tps)
     fp_sum = np.cumsum(fps)
@@ -131,7 +235,11 @@ def compute_pr(det_matches, det_scores, n_gt, recall_samples=None, interp=False)
                 precision2[recall_index] = precision[precision_index]
         precision = precision2
         recall = recall_samples
+
+#    print("precision = {}".format(str(precision)))
+#    print("recall = {}".format(str(recall)))
     
+        
     return (precision, recall)
     
     
