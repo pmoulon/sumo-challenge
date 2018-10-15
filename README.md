@@ -41,7 +41,7 @@ git clone https://github.com/facebookresearch/sumo-challenge.git
 
 ### Setup Virtual Environment
 
-Create a virtual evironment where the required packages will be installed in isolation.
+Create a virtual environment where the required packages will be installed in isolation.
 ```
 cd sumo-challenge/sumo-api
 python3 -m venv venv
